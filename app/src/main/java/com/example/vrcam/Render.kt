@@ -15,7 +15,6 @@ import android.graphics.RectF
 import android.graphics.Shader
 import android.os.Environment
 import android.provider.MediaStore
-import kotlin.math.abs
 import kotlin.math.cos
 import kotlin.math.hypot
 import kotlin.math.max
@@ -209,6 +208,19 @@ private fun drawEye(canvas: Canvas, bmp: Bitmap, dst: RectF, paint: Paint, effec
             )
             canvas.drawRect(dst, Paint().apply { this.shader = shader })
         }
+        Effect.EDGES -> {
+            val boost = ColorMatrixColorFilter(
+                ColorMatrix(floatArrayOf(3f, 0f, 0f, 0f, 0f, 0f, 3f, 0f, 0f, 0f, 0f, 0f, 3f, 0f, 0f, 0f, 0f, 0f, 1f, 0f))
+            )
+            val base = Paint(paint).apply { colorFilter = boost }
+            val diff = Paint(base).apply { blendMode = BlendMode.DIFFERENCE }
+            val o = dst.width() * 0.004f
+            canvas.save()
+            canvas.clipRect(RectF(dst.left + o, dst.top + o, dst.right, dst.bottom))
+            canvas.drawBitmap(bmp, src, dst, base)
+            canvas.drawBitmap(bmp, src, RectF(dst.left + o, dst.top + o, dst.right + o, dst.bottom + o), diff)
+            canvas.restore()
+        }
         Effect.FISHEYE, Effect.PINCH, Effect.SWIRL, Effect.WAVE, Effect.RIPPLE, Effect.WIDE ->
             drawWarped(canvas, bmp, dst, paint, effect)
         else -> canvas.drawBitmap(bmp, src, dst, paint)
@@ -290,30 +302,4 @@ fun saveToGallery(context: Context, bmp: Bitmap): Boolean = try {
     }
 } catch (e: Exception) {
     false
-}
-
-/** Edge detection (Sobel): bright outlines on black, like the Edges filter in the reference video. */
-fun sobelEdges(src: Bitmap): Bitmap {
-    val w = 640
-    val h = max(2, src.height * w / src.width)
-    val small = Bitmap.createScaledBitmap(src, w, h, true)
-    val px = IntArray(w * h)
-    small.getPixels(px, 0, w, 0, 0, w, h)
-    val g = IntArray(w * h) {
-        val c = px[it]
-        (((c shr 16) and 255) * 299 + ((c shr 8) and 255) * 587 + (c and 255) * 114) / 1000
-    }
-    val out = IntArray(w * h) { 0xFF000000.toInt() }
-    for (y in 1 until h - 1) {
-        val row = y * w
-        for (x in 1 until w - 1) {
-            val i = row + x
-            val gx = -g[i - w - 1] + g[i - w + 1] - 2 * g[i - 1] + 2 * g[i + 1] - g[i + w - 1] + g[i + w + 1]
-            val gy = -g[i - w - 1] - 2 * g[i - w] - g[i - w + 1] + g[i + w - 1] + 2 * g[i + w] + g[i + w + 1]
-            val m = min(255, (abs(gx) + abs(gy)) * 3 / 2)
-            out[i] = 0xFF000000.toInt() or (m shl 16) or (m shl 8) or m
-        }
-    }
-    if (small !== src) small.recycle()
-    return Bitmap.createBitmap(out, w, h, Bitmap.Config.ARGB_8888)
 }

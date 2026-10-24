@@ -171,11 +171,9 @@ fun CameraScreen() {
                 val degrees = proxy.imageInfo.rotationDegrees
                 proxy.close()
                 val upright = orient(raw, degrees, mirror)
-                // Edge detection works on the pixels, so it is done here once per frame.
-                val shown = if (live.filter.effect == Effect.EDGES) sobelEdges(upright) else upright
-                frame.value = shown
+                frame.value = upright
                 live.recorder?.draw { c, w, h ->
-                    renderFrame(c, w.toFloat(), h.toFloat(), shown, live.filter, live.vr, live.params)
+                    renderFrame(c, w.toFloat(), h.toFloat(), upright, live.filter, live.vr, live.params)
                 }
             }
             p.unbindAll()
