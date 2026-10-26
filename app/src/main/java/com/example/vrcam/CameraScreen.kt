@@ -1,6 +1,8 @@
 package com.example.vrcam
 
 import android.Manifest
+import android.content.Context
+import android.content.SharedPreferences
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.Canvas
@@ -65,6 +67,40 @@ import java.util.concurrent.Executors
 /** The camera thread needs to know the current filter (edge detection is done per frame). */
 private class LiveState {
     @Volatile var filter: CamFilter = CamFilter.NORMAL
+    @Volatile var scanning: Boolean = false
+    var frameCount: Int = 0
+}
+
+private fun loadCardboard(prefs: SharedPreferences): CardboardParams? {
+    if (!prefs.getBoolean("cb_on", false)) return null
+    val d = CardboardParams.DEFAULT
+    return CardboardParams(
+        vendor = prefs.getString("cb_vendor", d.vendor) ?: d.vendor,
+        model = prefs.getString("cb_model", d.model) ?: d.model,
+        screenToLens = prefs.getFloat("cb_s2l", d.screenToLens),
+        interLens = prefs.getFloat("cb_ipd", d.interLens),
+        fovLeft = prefs.getFloat("cb_fl", d.fovLeft),
+        fovRight = prefs.getFloat("cb_fr", d.fovRight),
+        fovBottom = prefs.getFloat("cb_fb", d.fovBottom),
+        fovTop = prefs.getFloat("cb_ft", d.fovTop),
+        trayToLens = prefs.getFloat("cb_tray", d.trayToLens),
+        verticalAlignment = prefs.getInt("cb_valign", d.verticalAlignment),
+        k1 = prefs.getFloat("cb_k1", d.k1),
+        k2 = prefs.getFloat("cb_k2", d.k2)
+    )
+}
+
+private fun saveCardboard(prefs: SharedPreferences, cb: CardboardParams?) {
+    val e = prefs.edit().putBoolean("cb_on", cb != null)
+    if (cb != null) {
+        e.putString("cb_vendor", cb.vendor).putString("cb_model", cb.model)
+            .putFloat("cb_s2l", cb.screenToLens).putFloat("cb_ipd", cb.interLens)
+            .putFloat("cb_fl", cb.fovLeft).putFloat("cb_fr", cb.fovRight)
+            .putFloat("cb_fb", cb.fovBottom).putFloat("cb_ft", cb.fovTop)
+            .putFloat("cb_tray", cb.trayToLens).putInt("cb_valign", cb.verticalAlignment)
+            .putFloat("cb_k1", cb.k1).putFloat("cb_k2", cb.k2)
+    }
+    e.apply()
 }
 
 @Composable
@@ -97,18 +133,46 @@ fun CameraScreen() {
 
     var lens by remember { mutableIntStateOf(CameraSelector.LENS_FACING_BACK) }
     var filter by remember { mutableStateOf(CamFilter.NORMAL) }
-    var vrMode by remember { mutableStateOf(true) }
+    var vrMode by remember { mutableStateOf(false) }
     var flip180 by remember { mutableStateOf(false) }
     var menuOpen by remember { mutableStateOf(false) }
     val frame = remember { mutableStateOf<Bitmap?>(null) }
     val live = remember { LiveState() }
     val scope = rememberCoroutineScope()
     val executor = remember { Executors.newSingleThreadExecutor() }
+    val prefs = remember { context.getSharedPreferences("vrcam", Context.MODE_PRIVATE) }
+    var cardboard by remember { mutableStateOf(loadCardboard(prefs)) }
+    var scanning by remember { mutableStateOf(false) }
+    var cbMenuOpen by remember { mutableStateOf(false) }
+    val metrics = context.resources.displayMetrics
 
-    SideEffect { live.filter = filter }
+    SideEffect {
+        live.filter = filter
+        live.scanning = scanning
+    }
 
-    // Back leaves VR mode (to get the menu and buttons).
-    BackHandler(enabled = vrMode) { vrMode = false }
+    fun toast(message: String) = Toast.makeText(context, message, Toast.LENGTH_LONG).show()
+
+    fun useViewer(params: CardboardParams?) {
+        cardboard = params
+        saveCardboard(prefs, params)
+    }
+
+    // Called with the text of a QR code the camera has seen.
+    suspend fun handleQr(text: String) {
+        scanning = false
+        val params = resolveCardboardUrl(text)
+        if (params == null) {
+            toast("That is not a Cardboard QR code (or it needs internet to open)")
+        } else {
+            useViewer(params)
+            toast("Viewer set: ${params.label}")
+        }
+    }
+
+    // Back leaves scanning, then VR mode (to get the menu and buttons).
+    BackHandler(enabled = scanning) { scanning = false }
+    BackHandler(enabled = vrMode && !scanning) { vrMode = false }
 
     // Bind the camera; every frame is converted to an upright bitmap and published to `frame`.
     DisposableEffect(lens) {
@@ -136,7 +200,13 @@ fun CameraScreen() {
                 val degrees = proxy.imageInfo.rotationDegrees
                 proxy.close()
                 val upright = orient(raw, degrees, mirror)
-                frame.value = if (live.filter.effect == Effect.EDGES) sobelEdges(upright) else upright
+                if (live.scanning && ++live.frameCount % 4 == 0) {
+                    decodeQr(upright)?.let { text ->
+                        live.scanning = false
+                        scope.launch { handleQr(text) }
+                    }
+                }
+                frame.value = PixelFx.process(upright, live.filter.effect)
             }
             p.unbindAll()
             p.bindToLifecycle(
@@ -192,11 +262,19 @@ fun CameraScreen() {
 
         androidx.compose.foundation.Canvas(Modifier.fillMaxSize()) {
             val bmp = frame.value ?: return@Canvas
+            val cb = cardboard
             drawIntoCanvas { c ->
-                renderFrame(
-                    c.nativeCanvas, size.width, size.height, bmp, filter, vrMode,
-                    ViewParams(flip180 = flip180), paint
-                )
+                if (vrMode && cb != null) {
+                    renderCardboard(
+                        c.nativeCanvas, size.width, size.height, bmp, filter, cb,
+                        metrics.xdpi, metrics.ydpi, flip180
+                    )
+                } else {
+                    renderFrame(
+                        c.nativeCanvas, size.width, size.height, bmp, filter, vrMode,
+                        ViewParams(flip180 = flip180), paint
+                    )
+                }
             }
         }
 
@@ -244,8 +322,38 @@ fun CameraScreen() {
                 }
             }
 
+            // Cardboard viewer menu
+            Box(Modifier.align(Alignment.TopEnd).padding(12.dp)) {
+                FilledTonalButton(onClick = { cbMenuOpen = true }) {
+                    Text("Cardboard: ${if (cardboard == null) "off" else "on"}  ▾")
+                }
+                DropdownMenu(expanded = cbMenuOpen, onDismissRequest = { cbMenuOpen = false }) {
+                    DropdownMenuItem(
+                        text = {
+                            Text(
+                                "Viewer: ${cardboard?.label ?: "none (flat side-by-side)"}",
+                                fontSize = 12.sp, color = Color.Gray
+                            )
+                        },
+                        onClick = {}, enabled = false
+                    )
+                    DropdownMenuItem(
+                        text = { Text("Scan viewer QR code") },
+                        onClick = { cbMenuOpen = false; scanning = true }
+                    )
+                    DropdownMenuItem(
+                        text = { Text("Generic Cardboard") },
+                        onClick = { cbMenuOpen = false; useViewer(CardboardParams.DEFAULT) }
+                    )
+                    DropdownMenuItem(
+                        text = { Text("Off (flat side-by-side)") },
+                        onClick = { cbMenuOpen = false; useViewer(null) }
+                    )
+                }
+            }
+
             // Bottom controls
-            Row(
+            if (scanning) ScanHint(Modifier.align(Alignment.BottomCenter)) { scanning = false } else Row(
                 Modifier.align(Alignment.BottomCenter).fillMaxWidth().padding(horizontal = 24.dp, vertical = 16.dp),
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically
@@ -271,5 +379,20 @@ fun CameraScreen() {
                 FilledTonalButton(onClick = { vrMode = true }) { Text("VR") }
             }
         }
+    }
+}
+
+@Composable
+private fun ScanHint(modifier: Modifier, onCancel: () -> Unit) {
+    Column(
+        modifier.padding(16.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.spacedBy(8.dp)
+    ) {
+        Text(
+            "Point the camera at the QR code on your Cardboard viewer",
+            color = Color.White, fontSize = 16.sp
+        )
+        FilledTonalButton(onClick = onCancel) { Text("Cancel") }
     }
 }
